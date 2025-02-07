@@ -1,0 +1,172 @@
+#!/bin/bash
+
+# Variables
+RESOURCE_GROUP="ad-lab-rg"
+LOCATION="eastus"
+VNET_NAME="ad-lab-vnet"
+DC_NAME="dc01"
+CLIENT1_NAME="client01"
+CLIENT2_NAME="client02"
+ADMIN_USERNAME="azureadmin"
+ADMIN_PASSWORD=$(openssl rand -base64 16)
+DOMAIN_NAME="contoso.local"
+SAFE_MODE_PASSWORD=$(openssl rand -base64 16)
+
+echo "===== SAVE THESE CREDENTIALS ====="
+echo "Admin Username: $ADMIN_USERNAME"
+echo "Admin Password: $ADMIN_PASSWORD"
+echo "Safe Mode Password: $SAFE_MODE_PASSWORD"
+echo "================================="
+
+# Create Resource Group
+az group create --name $RESOURCE_GROUP --location $LOCATION
+
+# Create Virtual Network
+az network vnet create \
+    --resource-group $RESOURCE_GROUP \
+    --name $VNET_NAME \
+    --address-prefix 10.0.0.0/16 \
+    --subnet-name default \
+    --subnet-prefix 10.0.0.0/24
+
+# Create Domain Controller VM with Trusted Launch
+az vm create \
+    --resource-group $RESOURCE_GROUP \
+    --name $DC_NAME \
+    --image Win2022Datacenter \
+    --admin-username $ADMIN_USERNAME \
+    --admin-password $ADMIN_PASSWORD \
+    --size Standard_D2s_v3 \
+    --private-ip-address 10.0.0.4 \
+    --vnet-name $VNET_NAME \
+    --subnet default \
+    --public-ip-sku Standard \
+    --security-type TrustedLaunch \
+    --enable-vtpm true \
+    --enable-secure-boot true
+
+echo "Domain Controller VM created. Installing AD DS..."
+
+# Install and Configure AD DS
+az vm run-command invoke \
+    --resource-group $RESOURCE_GROUP \
+    --name $DC_NAME \
+    --command-id RunPowerShellScript \
+    --scripts '
+# Install AD DS and management tools
+Install-WindowsFeature -Name AD-Domain-Services, RSAT-AD-PowerShell -IncludeManagementTools
+
+# Import AD DS Deployment module
+Import-Module ADDSDeployment
+
+# Configure AD DS and create domain
+$password = $args[0] | ConvertTo-SecureString -AsPlainText -Force
+Install-ADDSForest `
+    -DomainName $args[1] `
+    -SafeModeAdministratorPassword $password `
+    -InstallDns `
+    -Force
+' \
+    --parameters "$SAFE_MODE_PASSWORD" "$DOMAIN_NAME"
+
+echo "AD DS installation initiated. Waiting for completion and restart..."
+sleep 600  # Wait 10 minutes for AD DS installation and restart
+
+# Update VNET with DC's DNS server
+echo "Updating VNET DNS settings..."
+az network vnet update \
+    --resource-group $RESOURCE_GROUP \
+    --name $VNET_NAME \
+    --dns-servers 10.0.0.4
+
+# Verify DC is responding
+echo "Verifying Domain Controller status..."
+az vm run-command invoke \
+    --resource-group $RESOURCE_GROUP \
+    --name $DC_NAME \
+    --command-id RunPowerShellScript \
+    --scripts 'Get-Service NTDS, ADWS; Get-ADDomain'
+
+# Create Client VMs
+echo "Creating client VMs..."
+for CLIENT_NAME in $CLIENT1_NAME $CLIENT2_NAME; do
+    az vm create \
+        --resource-group $RESOURCE_GROUP \
+        --name $CLIENT_NAME \
+        --image MicrosoftWindowsDesktop:Windows-10:win10-22h2-pro:latest \
+        --admin-username $ADMIN_USERNAME \
+        --admin-password $ADMIN_PASSWORD \
+        --size Standard_D2s_v3 \
+        --vnet-name $VNET_NAME \
+        --subnet default \
+        --public-ip-sku Standard
+done
+
+echo "Waiting for client VMs to be ready..."
+sleep 180  # Wait 3 minutes
+
+# Join clients to domain
+echo "Joining clients to domain..."
+for CLIENT_NAME in $CLIENT1_NAME $CLIENT2_NAME; do
+    echo "Joining $CLIENT_NAME to domain..."
+    az vm run-command invoke \
+        --resource-group $RESOURCE_GROUP \
+        --name $CLIENT_NAME \
+        --command-id RunPowerShellScript \
+        --scripts '
+$password = $args[0] | ConvertTo-SecureString -AsPlainText -Force
+$credential = New-Object System.Management.Automation.PSCredential("$args[1]\$args[2]", $password)
+Add-Computer -DomainName $args[1] -Credential $credential -Restart -Force
+' \
+        --parameters "$ADMIN_PASSWORD" "$DOMAIN_NAME" "$ADMIN_USERNAME"
+done
+
+# Add RDP access rules
+echo "Adding RDP access rules..."
+for VM in $DC_NAME $CLIENT1_NAME $CLIENT2_NAME; do
+    az network nsg rule create \
+        --resource-group $RESOURCE_GROUP \
+        --nsg-name "${VM}NSG" \
+        --name allow-rdp \
+        --protocol Tcp \
+        --direction Inbound \
+        --source-address-prefix "*" \
+        --source-port-range "*" \
+        --destination-address-prefix "*" \
+        --destination-port-range 3389 \
+        --access Allow \
+        --priority 300
+done
+
+# Verify domain joins
+echo "Verifying domain joins..."
+sleep 120  # Wait for restarts to complete
+
+for CLIENT_NAME in $CLIENT1_NAME $CLIENT2_NAME; do
+    az vm run-command invoke \
+        --resource-group $RESOURCE_GROUP \
+        --name $CLIENT_NAME \
+        --command-id RunPowerShellScript \
+        --scripts '(Get-WmiObject -Class Win32_ComputerSystem).Domain'
+done
+
+# Final verification from DC
+az vm run-command invoke \
+    --resource-group $RESOURCE_GROUP \
+    --name $DC_NAME \
+    --command-id RunPowerShellScript \
+    --scripts 'Get-ADComputer -Filter *'
+
+# Display all connection information
+echo ""
+echo "===== IMPORTANT INFORMATION ====="
+echo "Domain: $DOMAIN_NAME"
+echo "Admin Username: $ADMIN_USERNAME (use contoso\\$ADMIN_USERNAME after domain join)"
+echo "Admin Password: $ADMIN_PASSWORD"
+echo "Safe Mode Password: $SAFE_MODE_PASSWORD"
+echo ""
+echo "RDP Connection Details:"
+echo "DC (dc01) IP: $(az vm show -d -g $RESOURCE_GROUP -n $DC_NAME --query publicIps -o tsv)"
+echo "Client1 IP: $(az vm show -d -g $RESOURCE_GROUP -n $CLIENT1_NAME --query publicIps -o tsv)"
+echo "Client2 IP: $(az vm show -d -g $RESOURCE_GROUP -n $CLIENT2_NAME --query publicIps -o tsv)"
+echo "=============================="
